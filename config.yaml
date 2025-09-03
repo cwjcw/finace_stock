@@ -1,0 +1,13 @@
+timezone: "Asia/Shanghai"
+
+watchlist:
+  - "600519"
+  - "000858"
+  - "300750"
+  - "601318"
+
+rss_feeds:
+  - "https://www.ftchinese.com/rss/news"
+  - "https://rsshub.app/reuters/world"
+  - "https://rsshub.app/reuters/business"
+rss_limit: 8
