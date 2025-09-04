@@ -1,108 +1,186 @@
-import os, io, math, yaml, pytz, requests, feedparser, pandas as pd
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+finance_morning.py — 数据抓取 + 渲染模块（含“测试/预览”，绝不发送）
+- 读取 config.yaml / users.yaml
+- 抓取：大盘（AkShare + 新浪兜底）、北向、自选股、RSS
+- 渲染：输出 Markdown
+- CLI（仅测试）：打印并保存到 out/，不发送
+"""
+
+import argparse
+import io
+import math
+import os
+import re
 from datetime import datetime
-from typing import List, Dict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import akshare as ak
+import feedparser
+import pytz
+import requests
+import yaml
 
-BASE_DIR = os.path.dirname(__file__)
-CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
-USERS_PATH  = os.path.join(BASE_DIR, "users.yaml")
-ENV_PATH    = os.path.join(BASE_DIR, ".env")
+# 路径按你的项目
+BASE_DIR = Path("/home/cwj/code/finace_stock").resolve()
+CONFIG_PATH = BASE_DIR / "config.yaml"
+USERS_PATH  = BASE_DIR / "users.yaml"
 
-# ---------- 工具 ----------
-def load_yaml(path: str) -> dict:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-def load_env(path: str) -> Dict[str, str]:
-    env = {}
-    if os.path.exists(path):
+# ---------- 基础加载 ----------
+def load_yaml(path: Path) -> dict:
+    if path.exists():
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if (not line) or line.startswith("#") or ("=" not in line):
-                    continue
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-    # 系统环境变量优先
-    env.update({k: os.environ[k] for k in os.environ})
-    return env
+            return yaml.safe_load(f) or {}
+    return {}
 
-def pct(x):
-    try: return f"{x:.2f}%"
-    except: return "-"
+def pct(x) -> str:
+    try:
+        return f"{x:.2f}%"
+    except Exception:
+        return "-"
 
-def now_str(tzname: str):
+def now_str(tzname: str) -> str:
+    import pytz
     return datetime.now(pytz.timezone(tzname)).strftime("%Y-%m-%d %H:%M")
 
-def get_secret(secrets: dict, envmap: dict, key: str, default: str="") -> str:
-    """secrets 里允许写 env:VAR_NAME，从 envmap 取值；也支持明文（不推荐）"""
-    val = (secrets or {}).get(key, "")
-    if isinstance(val, str) and val.startswith("env:"):
-        envkey = val.split(":",1)[1].strip()
-        return envmap.get(envkey, default)
-    return val or default
+def normalize_to_prefixed(code_like: str) -> str:
+    """
+    任意形态 -> 带前缀：sh600519 / sz000858
+    """
+    if not code_like:
+        return ""
+    s = str(code_like).strip().lower()
+    m = re.search(r"(\d{6})", s)
+    if not m:
+        return ""
+    x = m.group(1)
+    if s.startswith("sh"):
+        return "sh" + x
+    if s.startswith("sz"):
+        return "sz" + x
+    if x.startswith(("600","601","603","605","688","689","900")):
+        return "sh" + x
+    return "sz" + x
 
-# ---------- 数据 ----------
-def fetch_index_snapshot():
-    """三大指数：上证(000001) 深成(399001) 创业板(399006)"""
+def pick_user_value(user: dict, defaults: dict, key: str, fallback=None):
+    """
+    存在就用用户字段（哪怕是空列表/空字符串），否则用全局，最后 fallback
+    """
+    if key in user:
+        return user[key]
+    if key in defaults:
+        return defaults[key]
+    return fallback
+
+# ---------- 大盘（AkShare + 新浪兜底） ----------
+def _fetch_index_snapshot_ak() -> List[dict]:
+    df = ak.stock_zh_index_spot()
+    if df is None or df.empty or ("代码" not in df.columns):
+        return []
+    df = df.copy()
+    df["code6"] = df["代码"].astype(str).str.extract(r"(\d{6})")
+    targets = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
+    out = []
+    for code6, name in targets.items():
+        row = df[df["code6"] == code6]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        try:
+            price = float(r.get("最新价", math.nan))
+            chg   = float(str(r.get("涨跌幅","0")).replace("%","") or 0.0)
+        except Exception:
+            price, chg = math.nan, math.nan
+        out.append({"name": name, "price": price, "change_pct": chg})
+    return out
+
+def _fetch_index_snapshot_sina() -> List[dict]:
+    items = [
+        ("上证指数", "s_sh000001"),
+        ("深证成指", "s_sz399001"),
+        ("创业板指", "s_sz399006"),
+    ]
+    url = "https://hq.sinajs.cn/?list=" + ",".join(code for _, code in items)
+    headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers, timeout=8)
+    text = resp.content.decode("gbk", errors="ignore")
+    out = []
+    for (expected, _), line in zip(items, text.strip().splitlines()):
+        m = re.search(r'="([^"]*)"', line)
+        if not m:
+            continue
+        parts = m.group(1).split(",")
+        try:
+            price = float(parts[1]) if parts[1] else math.nan
+            cpct  = float(parts[3].replace("%","")) if len(parts)>3 and parts[3] else math.nan
+            out.append({"name": expected, "price": price, "change_pct": cpct})
+        except Exception:
+            continue
+    return out
+
+def fetch_index_snapshot() -> List[dict]:
     try:
-        df = ak.stock_zh_index_spot()
-        targets = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
-        out = []
-        for code, name in targets.items():
-            row = df[df['代码'] == code]
-            if not row.empty:
-                r = row.iloc[0]
-                out.append({
-                    "name": name,
-                    "price": float(r.get("最新价", math.nan)),
-                    "change_pct": float(str(r.get("涨跌幅","0")).replace("%","") or 0.0)
-                })
-        return out
+        out = _fetch_index_snapshot_ak()
+        if len(out) == 3 and all(isinstance(x.get("price"), (int,float)) and not math.isnan(x["price"]) for x in out):
+            return out
     except Exception:
-        return [{"name":"上证指数","price":math.nan,"change_pct":math.nan},
-                {"name":"深证成指","price":math.nan,"change_pct":math.nan},
-                {"name":"创业板指","price":math.nan,"change_pct":math.nan}]
+        pass
+    try:
+        return _fetch_index_snapshot_sina()
+    except Exception:
+        return [
+            {"name":"上证指数","price":math.nan,"change_pct":math.nan},
+            {"name":"深证成指","price":math.nan,"change_pct":math.nan},
+            {"name":"创业板指","price":math.nan,"change_pct":math.nan},
+        ]
 
-def fetch_north_money():
-    """北向资金净流入（亿元）"""
+# ---------- 其它数据 ----------
+def fetch_north_money() -> dict:
     try:
         df = ak.stock_hsgt_north_net_flow_in()
         if df is not None and not df.empty:
             last = df.iloc[-1]
             date = str(last.get("日期") or last.get("date") or "")
-            val = last.get("北向资金") or last.get("north_money") or last.get("北向资金净流入")
+            val  = last.get("北向资金") or last.get("north_money") or last.get("北向资金净流入")
             try: val = float(val)
-            except: val = None
+            except Exception: val = None
             return {"date": date, "north_net_in": val}
     except Exception:
         pass
     return {"date": "", "north_net_in": None}
 
-def fetch_watchlist(codes: List[str]):
-    """自选股快照（从全市场快照中过滤）"""
+def fetch_watchlist(codes: List[str]) -> List[dict]:
     try:
-        if not codes: return []
+        if codes is None:
+            return []
+        want = {normalize_to_prefixed(c) for c in codes if c}
+        if not want:
+            return []
         df = ak.stock_zh_a_spot()
-        df = df[df["代码"].isin(codes)]
+        if df is None or df.empty or ("代码" not in df.columns):
+            return []
+        df = df.copy()
+        df["code6"]     = df["代码"].astype(str).str.extract(r"(\d{6})")
+        df["code_pref"] = df["code6"].apply(normalize_to_prefixed)
+        df = df[df["code_pref"].isin(want)]
         res = []
         for _, r in df.iterrows():
             try:
                 res.append({
-                    "code": str(r.get("代码","")),
-                    "name": str(r.get("名称","")),
+                    "code":  str(r.get("code_pref","")),
+                    "name":  str(r.get("名称","")),
                     "price": float(r.get("最新价", math.nan)),
-                    "change_pct": float(str(r.get("涨跌幅","0")).replace("%","") or 0.0)
+                    "change_pct": float(str(r.get("涨跌幅","0")).replace("%","") or 0.0),
                 })
-            except:
+            except Exception:
                 continue
         return sorted(res, key=lambda x: abs(x.get("change_pct") or 0), reverse=True)
     except Exception:
         return []
 
-def fetch_rss(feeds: List[str], limit_per_feed: int = 6):
+def fetch_rss(feeds: List[str], limit_per_feed: int = 6) -> List[dict]:
     items = []
     for url in feeds or []:
         try:
@@ -110,26 +188,26 @@ def fetch_rss(feeds: List[str], limit_per_feed: int = 6):
             cnt = 0
             for e in d.entries:
                 title = getattr(e, "title", "(no title)")
-                link = getattr(e, "link", "")
-                pub  = getattr(e, "published", getattr(e, "updated", ""))
+                link  = getattr(e, "link",  "")
+                pub   = getattr(e, "published", getattr(e, "updated", ""))
                 items.append({"source": url, "title": title.strip(), "link": link, "time": pub})
                 cnt += 1
                 if cnt >= limit_per_feed: break
-        except:
+        except Exception:
             continue
     return items
 
 # ---------- 渲染 ----------
-def render_markdown(gen_time, idx, north, watchlist, rss_items, username=""):
+def render_markdown(gen_time: str, idx, north, watchlist, rss_items, username: str="") -> str:
     s = io.StringIO()
-    title_prefix = f"{username}的" if username else ""
-    s.write(f"# 📈 {title_prefix}每日财经早报（{gen_time}）\n\n")
+    pre = f"{username}的" if username else ""
+    s.write(f"# 📈 {pre}每日财经早报（{gen_time}）\n\n")
 
     s.write("## 大盘速览\n")
     for x in idx:
         cp = x.get("change_pct")
-        arrow = "🔺" if (isinstance(cp,(int,float)) and cp>=0) else "🔻"
-        price = f"{x.get('price'):.2f}" if isinstance(x.get('price'),(int,float)) else "-"
+        arrow  = "🔺" if (isinstance(cp,(int,float)) and cp>=0) else "🔻"
+        price  = f"{x.get('price'):.2f}" if isinstance(x.get("price"),(int,float)) else "-"
         cp_str = pct(cp) if isinstance(cp,(int,float)) else "-"
         s.write(f"- {x['name']}：{price}（{arrow} {cp_str}）\n")
     s.write("\n")
@@ -145,8 +223,8 @@ def render_markdown(gen_time, idx, north, watchlist, rss_items, username=""):
         s.write("## 自选股动向\n")
         for r in watchlist:
             cp = r.get("change_pct")
-            arrow = "🔺" if (isinstance(cp,(int,float)) and cp>=0) else "🔻"
-            price = f"{r.get('price'):.2f}" if isinstance(r.get('price'),(int,float)) else "-"
+            arrow  = "🔺" if (isinstance(cp,(int,float)) and cp>=0) else "🔻"
+            price  = f"{r.get('price'):.2f}" if isinstance(r.get("price"),(int,float)) else "-"
             cp_str = pct(cp) if isinstance(cp,(int,float)) else "-"
             s.write(f"- {r['name']}({r['code']})：{price}（{arrow} {cp_str}）\n")
         s.write("\n")
@@ -158,97 +236,66 @@ def render_markdown(gen_time, idx, north, watchlist, rss_items, username=""):
             s.write(f"- [{t}]({it['link']})\n")
         s.write("\n")
 
-    s.write("> 数据来源：交易所/公开RSS/akshare。仅作信息参考，不构成投资建议。\n")
+    s.write("> 数据来源：交易所/公开RSS/akshare/新浪。仅作信息参考，不构成投资建议。\n")
     return s.getvalue()
 
-# ---------- 推送 ----------
-def push_serverchan(sendkey: str, title: str, markdown: str):
-    if not sendkey:
-        return (0, "No SendKey")
-    url = f"https://sctapi.ftqq.com/{sendkey}.send"
-    data = {"text": title, "desp": markdown}
-    r = requests.post(url, data=data, timeout=12)
-    return (r.status_code, r.text)
-
-def push_telegram(bot_token: str, chat_id: str, title: str, markdown: str):
-    if not bot_token or not chat_id:
-        return (0, "No TG creds")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    text = f"{title}\n\n{markdown}"
-    r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-    return (r.status_code, r.text)
-
-def push_wecom(webhook: str, title: str, markdown: str):
-    if not webhook:
-        return (0, "No WeCom webhook")
-    payload = {"msgtype":"markdown","markdown":{"content": f"**{title}**\n\n{markdown}"}}
-    r = requests.post(webhook, json=payload, timeout=12)
-    return (r.status_code, r.text)
-
-# ---------- 主流程（单用户或多用户） ----------
-def run_for_user(u: dict, defaults: dict, envmap: dict):
-    uname   = u.get("name") or u.get("id","")
-    tzname  = u.get("timezone") or defaults.get("timezone","Asia/Shanghai")
-    wl      = u.get("watchlist") or defaults.get("watchlist",[])
-    feeds   = u.get("rss_feeds") if u.get("rss_feeds") else defaults.get("rss_feeds",[])
-    rss_lim = int(defaults.get("rss_limit", 6))
+# ---------- 生成报告（主暴露函数） ----------
+def generate_report(user: dict, defaults: dict) -> Tuple[str, dict]:
+    """
+    返回 (markdown, meta)
+    meta 含：gen_time, tzname, watchlist_count 等
+    """
+    tzname = pick_user_value(user, defaults, "timezone", "Asia/Shanghai")
+    wl     = pick_user_value(user, defaults, "watchlist", [])
+    feeds  = pick_user_value(user, defaults, "rss_feeds", [])
+    rslim  = int(pick_user_value(user, defaults, "rss_limit", 6))
 
     gen_time = now_str(tzname)
     idx   = fetch_index_snapshot()
     north = fetch_north_money()
     wlist = fetch_watchlist(wl)
-    rss   = fetch_rss(feeds, limit_per_feed=rss_lim)
-    md    = render_markdown(gen_time, idx, north, wlist, rss, username=uname)
-    title = f"每日财经早报 | {gen_time}"
+    rss   = fetch_rss(feeds, limit_per_feed=rslim)
+    md    = render_markdown(gen_time, idx, north, wlist, rss, username=user.get("name") or user.get("id",""))
+    meta  = {"gen_time": gen_time, "tz": tzname, "watchlist_count": len(wlist), "rss_count": len(rss)}
+    return md, meta
 
-    ch = (u.get("channel") or "serverchan").lower()
-    secrets = u.get("secrets") or {}
-
-    if ch == "serverchan":
-        sendkey = get_secret(secrets, envmap, "SCT_SENDKEY", "")
-        return ("serverchan", *push_serverchan(sendkey, title, md))
-    elif ch == "telegram":
-        token  = get_secret(secrets, envmap, "BOT_TOKEN", "")
-        chatid = get_secret(secrets, envmap, "CHAT_ID", "")
-        return ("telegram", *push_telegram(token, chatid, title, md))
-    elif ch == "wecom":
-        hook = get_secret(secrets, envmap, "WEBHOOK", "")
-        return ("wecom", *push_wecom(hook, title, md))
-    else:
-        print(f"[{uname}] 未知推送渠道：{ch}\n")
-        print(md)
-        return (ch, 0, "Unknown channel, printed to stdout")
-
-def main():
-    defaults = load_yaml(CONFIG_PATH)
-    users_cfg = load_yaml(USERS_PATH)
-    envmap = load_env(ENV_PATH)
-
-    if users_cfg.get("users"):
-        results = []
-        for u in users_cfg["users"]:
-            ch, code, text = run_for_user(u, defaults, envmap)
-            uid = u.get("id","")
-            print(f"[{uid}:{ch}] resp={code} {text[:200]}...")
-            results.append((uid, ch, code))
-        ok = sum(1 for _,_,c in results if int(c) == 200)
-        print(f"\nDone. success={ok}/{len(results)}")
-    else:
-        # 兼容：没有 users.yaml 时走单用户方糖（读环境变量 SCT_SENDKEY）
-        gen_time = now_str(defaults.get("timezone","Asia/Shanghai"))
-        idx   = fetch_index_snapshot()
-        north = fetch_north_money()
-        wlist = fetch_watchlist(defaults.get("watchlist",[]))
-        rss   = fetch_rss(defaults.get("rss_feeds",[]), limit_per_feed=int(defaults.get("rss_limit",6)))
-        md    = render_markdown(gen_time, idx, north, wlist, rss)
-        title = f"每日财经早报 | {gen_time}"
-        sendkey = os.getenv("SCT_SENDKEY","").strip() or load_env(ENV_PATH).get("SCT_SENDKEY","")
-        if sendkey:
-            code, text = push_serverchan(sendkey, title, md)
-            print(f"[single:serverchan] resp={code} {text[:200]}...")
-        else:
-            print(md)
-            print("\n[未配置 SendKey，已输出到控制台]")
+# =================== 仅用于“测试/预览”的 CLI ===================
+def _save(out_dir: Path, uid: str, content: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fn = out_dir / f"{uid}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+    fn.write_text(content, encoding="utf-8")
+    return fn
 
 if __name__ == "__main__":
-    main()
+    # 仅测试，不发送
+    ap = argparse.ArgumentParser(description="预览/测试（不发送）")
+    ap.add_argument("--user", help="只预览指定用户（users.yaml 的 id）")
+    ap.add_argument("--out-dir", default=str(BASE_DIR / "out"), help="输出目录")
+    args = ap.parse_args()
+
+    defaults = load_yaml(CONFIG_PATH)
+    users_cfg = load_yaml(USERS_PATH)
+    out_dir = Path(args.out_dir)
+
+    if users_cfg.get("users"):
+        users = users_cfg["users"]
+        if args.user:
+            users = [u for u in users if str(u.get("id","")) == args.user]
+            if not users:
+                print(f"未找到用户 id='{args.user}'")
+                raise SystemExit(2)
+        for u in users:
+            uid = u.get("id","user")
+            md, meta = generate_report(u, defaults)
+            print(f"\n===== [PREVIEW] {uid} ({meta['gen_time']}) =====\n")
+            print(md)
+            fn = _save(out_dir, uid, md)
+            print(f"[PREVIEW] 已保存: {fn}")
+    else:
+        # 单用户兼容（没 users.yaml 也能预览）
+        u = {"id":"single","name":"single"}
+        md, meta = generate_report(u, defaults)
+        print(f"\n===== [PREVIEW] single ({meta['gen_time']}) =====\n")
+        print(md)
+        fn = _save(out_dir, "single", md)
+        print(f"[PREVIEW] 已保存: {fn}")
