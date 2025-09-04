@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<a href="/logout">退出登录</a>
+<h2>个人设置</h2>
+<form method="post" action="/profile">
+  <label>时区
+    <input name="timezone" value="{{ me.timezone }}" placeholder="Asia/Shanghai">
+  </label>
+  <label>渠道
+    <select name="channel">
+      <option value="serverchan" {% if me.channel=="serverchan" %}selected{% endif %}>方糖</option>
+      <option value="telegram" {% if me.channel=="telegram" %}selected{% endif %}>Telegram</option>
+      <option value="wecom" {% if me.channel=="wecom" %}selected{% endif %}>企业微信</option>
+    </select>
+  </label>
+  <details>
+    <summary>推送密钥（按渠道填写，不用的留空）</summary>
+    <label>SCT_SENDKEY <input name="sct_sendkey" value="{{ me.sct_sendkey or '' }}"></label>
+    <label>TG_BOT_TOKEN <input name="tg_bot_token" value="{{ me.tg_bot_token or '' }}"></label>
+    <label>TG_CHAT_ID <input name="tg_chat_id" value="{{ me.tg_chat_id or '' }}"></label>
+    <label>WECOM_WEBHOOK <input name="wecom_webhook" value="{{ me.wecom_webhook or '' }}"></label>
+  </details>
+  <button type="submit">保存</button>
+</form>
+
+<h2>自选股</h2>
+<form method="post" action="/watch/add">
+  <input name="code" placeholder="sh600519 或 600519">
+  <button type="submit">添加</button>
+</form>
+<ul>
+  {% for w in wlist %}
+  <li>{{ w.code }}
+    <form method="post" action="/watch/del/{{ w.id }}" style="display:inline">
+      <button>删除</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+
+<h2>RSS 源</h2>
+<form method="post" action="/rss/add">
+  <input name="url" placeholder="https://...">
+  <button type="submit">添加</button>
+</form>
+<ul>
+  {% for r in rss %}
+  <li>{{ r.url }}
+    <form method="post" action="/rss/del/{{ r.id }}" style="display:inline">
+      <button>删除</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+
+<p><a href="/preview" target="_blank">👉 预览我的今日早报</a>（只展示，不发送）</p>
+{% endblock %}

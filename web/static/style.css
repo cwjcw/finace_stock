@@ -1,0 +1,7 @@
+body { max-width: 860px; margin: 0 auto; font-family: system-ui, -apple-system, "Segoe UI", Arial; padding: 16px; }
+header { border-bottom: 1px solid #eee; margin-bottom: 12px; }
+label { display:block; margin: 8px 0; }
+input, select { padding: 6px 8px; min-width: 260px; }
+button { padding: 6px 10px; }
+details { margin:8px 0; }
+ul { padding-left: 20px; }

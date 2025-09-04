@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>注册</h2>
+<form method="post">
+  <label>ID <input name="uid" required></label><br>
+  <label>昵称 <input name="name" required></label><br>
+  <label>密码 <input type="password" name="password" required></label><br>
+  <button type="submit">注册</button>
+  <p style="color:#c00">{{ error }}</p>
+</form>
+<p><a href="/login">去登录</a></p>
+{% endblock %}
