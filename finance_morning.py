@@ -28,6 +28,13 @@ BASE_DIR = Path("/home/cwj/code/finace_stock").resolve()
 CONFIG_PATH = BASE_DIR / "config.yaml"
 USERS_PATH  = BASE_DIR / "users.yaml"
 
+out_dir = 'out'
+if os.path.exists(out_dir):
+    for filename in os.listdir(out_dir):
+        file_path = os.path.join(out_dir, filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+
 # ---------- 基础加载 ----------
 def load_yaml(path: Path) -> dict:
     if path.exists():
